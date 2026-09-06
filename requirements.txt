@@ -4,3 +4,4 @@ pymongo
 dnspython
 psutil
 motor
+hachoir
