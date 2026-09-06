@@ -8,9 +8,10 @@
  Bibliothèque   : Pyrogram (+ TgCrypto pour le chiffrement C++ natif ultra-rapide)
  Persistance    : MongoDB Atlas (via motor, driver asynchrone)
  Monitoring     : psutil (RAM / disque / CPU pour le panneau admin)
+ Métadonnées    : hachoir (durée / largeur / hauteur réelles des vidéos)
 
  Installation :
-     pip install pyrogram tgcrypto motor dnspython psutil
+     pip install pyrogram tgcrypto motor dnspython psutil hachoir
 
  Avant de lancer le script, renseigne dans la section CONFIGURATION :
    - API_ID / API_HASH (https://my.telegram.org)
@@ -61,6 +62,7 @@ from pyrogram.errors import (
     ChannelPrivate,
     UsernameNotOccupied,
     PeerIdInvalid,
+    UserNotParticipant,
     RPCError,
 )
 
@@ -70,11 +72,17 @@ from motor.motor_asyncio import AsyncIOMotorClient
 # pip install psutil
 import psutil
 
+# hachoir est utilisé pour extraire la durée, la largeur et la hauteur réelles
+# des fichiers vidéo/audio, afin que Telegram affiche une vignette avec la
+# bonne durée au lieu de rester bloqué sur 00:00.
+# pip install hachoir
+from hachoir.parser import createParser
+from hachoir.metadata import extractMetadata
+
 # ==============================================================================
 # 1. CONFIGURATION - À REMPLIR OBLIGATOIREMENT
-# 1. CONFIGURATION - À REMPLIR OBLIGATOIREMENT
 # ==============================================================================
-API_ID = 37198974                     # <-- Remplace par ton API_ID (int)
+API_ID =  37198974                    # <-- Remplace par ton API_ID (int)
 API_HASH = "ee486ee12aa06c1b33e245bfb34dd43b"       # <-- Remplace par ton API_HASH (str)
 BOT_TOKEN = "8620294646:AAEA0amd3jaaNf2Zl5vf6X899YCzG27ScYo"     # <-- Remplace par le token donné par @BotFather
 
@@ -88,9 +96,16 @@ MAX_CANAUX = 4
 
 # Identifiant Telegram (numérique) de l'administrateur du bot.
 # Récupère le tien en écrivant à @userinfobot sur Telegram.
-ADMIN_ID = [6572180966, 7065230355]  # <-- Remplace par ton véritable user_id Telegram (int)
+ADMIN_ID = 6572180966  # <-- Remplace par ton véritable user_id Telegram (int)
 ADMIN_USERNAME = "altof3"        # Sans le @, utilisé dans les messages
 CANAL_OFFICIEL = "https://t.me/botpload"
+
+# Canal auquel l'utilisateur DOIT être abonné pour utiliser le bot.
+CANAL_OBLIGATOIRE = "@botpload"                    # Username utilisé pour get_chat_member
+CANAL_OBLIGATOIRE_LIEN = "https://t.me/botpload"    # Lien affiché dans le bouton "Rejoindre"
+
+# Délai (en secondes) avant suppression automatique des fichiers envoyés à l'utilisateur
+DELAI_SUPPRESSION_SECONDES = 900  # 15 minutes
 
 # --------------------------------------------------------------------------
 # GRILLE DES PLANS ET QUOTAS QUOTIDIENS (réinitialisés chaque jour)
@@ -140,6 +155,12 @@ pending_rename: dict[int, dict] = {}
 # Dictionnaire : user_id -> document utilisateur complet (plan, quota, police, etc.)
 # Sert de cache rapide, synchronisé avec la collection MongoDB "users".
 users_cache: dict[int, dict] = {}
+
+# Dictionnaire : user_id -> état intermédiaire du choix format/qualité, en attente
+# que l'utilisateur clique sur les boutons inline correspondants.
+# Structure : {"message_original": Message, "type_media": str, "nouveau_nom": str,
+#              "format_choisi": str | None}
+pending_traitement: dict[int, dict] = {}
 
 # ==============================================================================
 # 4. INITIALISATION DE MONGODB ATLAS (motor - driver asynchrone)
@@ -397,6 +418,87 @@ def convertir_police(texte: str, style: str) -> str:
 
 
 # ==============================================================================
+# 4ter. ABONNEMENT OBLIGATOIRE AU CANAL
+# ==============================================================================
+
+async def verifier_abonnement_canal(client: Client, user_id: int) -> bool:
+    """
+    Vérifie si un utilisateur est membre du canal obligatoire via get_chat_member.
+    Retourne True s'il est abonné, False sinon.
+
+    En cas d'erreur technique (canal temporairement inaccessible, problème réseau),
+    on choisit de NE PAS bloquer l'utilisateur pour éviter de rendre le bot
+    totalement inutilisable à cause d'un souci indépendant de sa volonté — seul
+    un "UserNotParticipant" explicite (l'utilisateur a réellement quitté ou n'a
+    jamais rejoint) entraîne un blocage.
+    """
+    try:
+        membre = await client.get_chat_member(CANAL_OBLIGATOIRE, user_id)
+        return membre.status not in (enums.ChatMemberStatus.LEFT, enums.ChatMemberStatus.BANNED)
+    except UserNotParticipant:
+        return False
+    except Exception as erreur:
+        logger.warning(f"Impossible de vérifier l'abonnement de {user_id} au canal : {erreur}")
+        return True
+
+
+async def envoyer_message_abonnement_requis(client: Client, chat_id: int):
+    """Envoie le message de blocage avec les boutons 'Rejoindre' et 'Vérifier'."""
+    boutons = InlineKeyboardMarkup([
+        [InlineKeyboardButton("📢 Rejoindre le Canal", url=CANAL_OBLIGATOIRE_LIEN)],
+        [InlineKeyboardButton("✅ Vérifier", callback_data="verifier_abonnement")],
+    ])
+    await client.send_message(
+        chat_id,
+        "🔒 **Accès restreint**\n\n"
+        "Pour utiliser ce bot, tu dois d'abord rejoindre notre canal officiel :\n"
+        f"{CANAL_OBLIGATOIRE_LIEN}\n\n"
+        "Une fois abonné, clique sur **✅ Vérifier** ci-dessous.",
+        reply_markup=boutons,
+    )
+
+
+# --------------------------------------------------------------------------
+# CHOIX DE FORMAT ET DE QUALITÉ D'ENVOI (vidéos / documents vidéo)
+# --------------------------------------------------------------------------
+QUALITES_PREMIUM = {"4k", "8k"}
+NOMS_QUALITES = {
+    "480p": "⚡ Faible (480p)",
+    "hd": "📺 HD (720p/1080p)",
+    "4k": "👑 4K Ultra HD",
+    "8k": "👑 8K Extreme HD",
+}
+
+EXTENSIONS_VIDEO = (".mp4", ".mkv", ".avi", ".mov", ".webm", ".flv", ".wmv", ".m4v", ".ts")
+
+
+def est_document_video(message: Message) -> bool:
+    """Détermine si un document envoyé est en réalité un fichier vidéo (par mime-type ou extension)."""
+    document = message.document
+    if not document:
+        return False
+    mime = (document.mime_type or "").lower()
+    nom = (document.file_name or "").lower()
+    return mime.startswith("video/") or nom.endswith(EXTENSIONS_VIDEO)
+
+
+async def supprimer_message_apres_delai(client: Client, chat_id: int, message_id: int,
+                                         delai_secondes: int = DELAI_SUPPRESSION_SECONDES):
+    """
+    Tâche asynchrone indépendante (lancée via asyncio.create_task) qui attend
+    le délai indiqué puis supprime automatiquement le message envoyé. N'importe
+    quelle erreur (message déjà supprimé manuellement, etc.) est journalisée
+    sans jamais interrompre le reste du bot.
+    """
+    await asyncio.sleep(delai_secondes)
+    try:
+        await client.delete_messages(chat_id, message_id)
+        logger.info(f"Message {message_id} supprimé automatiquement (délai écoulé) dans le chat {chat_id}")
+    except Exception as erreur:
+        logger.warning(f"Impossible de supprimer automatiquement le message {message_id} : {erreur}")
+
+
+# ==============================================================================
 # 5. INITIALISATION DU CLIENT PYROGRAM (avec optimisations de vitesse)
 # ==============================================================================
 app = Client(
@@ -484,6 +586,67 @@ def nettoyer_fichiers(*chemins: str):
                 logger.info(f"Fichier temporaire supprimé : {chemin}")
         except Exception as erreur:
             logger.warning(f"Impossible de supprimer {chemin} : {erreur}")
+
+
+def extraire_metadonnees_video(chemin_fichier: str) -> tuple[int, int, int]:
+    """
+    Extrait la durée réelle (en secondes), la largeur et la hauteur d'un
+    fichier vidéo (ou audio) grâce à hachoir, pour que Telegram affiche une
+    vignette avec la bonne durée au lieu de rester bloqué sur 00:00.
+
+    Retourne toujours un tuple (duree, largeur, hauteur) : en cas d'échec
+    d'analyse (fichier corrompu, format non reconnu, métadonnées absentes...),
+    retourne (0, 0, 0) sans jamais lever d'exception — le bot continue de
+    fonctionner normalement, simplement sans ces informations.
+    """
+    duree, largeur, hauteur = 0, 0, 0
+    parseur = None
+
+    try:
+        parseur = createParser(chemin_fichier)
+        if parseur is None:
+            logger.warning(f"hachoir n'a pas pu analyser ce fichier : {chemin_fichier}")
+            return duree, largeur, hauteur
+
+        try:
+            metadonnees = extractMetadata(parseur)
+        except Exception as erreur:
+            logger.warning(f"Échec de l'extraction des métadonnées ({chemin_fichier}) : {erreur}")
+            metadonnees = None
+
+        if metadonnees is not None:
+            # Chaque métadonnée est lue individuellement : l'absence de l'une
+            # d'entre elles (ex: pas de largeur/hauteur sur un fichier audio)
+            # ne doit jamais empêcher la récupération des autres.
+            if metadonnees.has("duration"):
+                try:
+                    duree = int(metadonnees.get("duration").total_seconds())
+                except Exception:
+                    pass
+            if metadonnees.has("width"):
+                try:
+                    largeur = int(metadonnees.get("width"))
+                except Exception:
+                    pass
+            if metadonnees.has("height"):
+                try:
+                    hauteur = int(metadonnees.get("height"))
+                except Exception:
+                    pass
+
+    except Exception as erreur:
+        # Filet de sécurité global : quoi qu'il arrive, on ne plante jamais le bot
+        # à cause d'un problème d'extraction de métadonnées.
+        logger.warning(f"Erreur inattendue lors de l'analyse hachoir ({chemin_fichier}) : {erreur}")
+
+    finally:
+        if parseur is not None:
+            try:
+                parseur.close()
+            except Exception:
+                pass
+
+    return duree, largeur, hauteur
 
 
 # ==============================================================================
@@ -1048,6 +1211,12 @@ filtre_renommage = filters.create(filtre_attente_renommage)
 
 @app.on_message(filters.text & filters.private & filtre_renommage & ~filters.command("annuler"))
 async def traiter_renommage(client: Client, message: Message):
+    """
+    Réceptionne le nouveau nom saisi par l'utilisateur. Pour une vidéo (ou un
+    document identifié comme vidéo), propose ensuite le choix du format et de
+    la qualité via des boutons inline. Pour un audio ou un document classique
+    (non vidéo), le traitement démarre directement (comportement historique).
+    """
     user_id = message.from_user.id
     infos = pending_rename.pop(user_id, None)
 
@@ -1063,6 +1232,125 @@ async def traiter_renommage(client: Client, message: Message):
         pending_rename[user_id] = infos
         return
 
+    est_video_reelle = type_media == "video" or (type_media == "document" and est_document_video(message_original))
+
+    if not est_video_reelle:
+        # Audio ou document non-vidéo classique : pas de menu format/qualité,
+        # traitement direct comme auparavant.
+        message_statut = await message.reply_text("⏳ Initialisation du téléchargement...")
+        format_envoi = "audio" if type_media == "audio" else "document"
+        await lancer_traitement_final(
+            client=client, user_id=user_id, message_statut=message_statut,
+            message_original=message_original, nouveau_nom=nouveau_nom,
+            format_envoi=format_envoi, qualite=None,
+        )
+        return
+
+    # Vidéo ou document vidéo : on propose d'abord le choix du format d'envoi
+    pending_traitement[user_id] = {
+        "message_original": message_original,
+        "type_media": type_media,
+        "nouveau_nom": nouveau_nom,
+        "format_choisi": None,
+    }
+
+    boutons = InlineKeyboardMarkup([[
+        InlineKeyboardButton("🎥 Vidéo", callback_data="format_video"),
+        InlineKeyboardButton("📁 Document", callback_data="format_document"),
+    ]])
+    await message.reply_text(
+        f"📦 Nouveau nom : `{nouveau_nom}`\n\n**Choisis le format d'envoi :**",
+        reply_markup=boutons,
+    )
+
+
+@app.on_callback_query(filters.regex(r"^format_(video|document)$"))
+async def callback_choix_format(client: Client, callback_query: CallbackQuery):
+    """Étape 1 : l'utilisateur choisit entre envoi en streaming vidéo ou en document brut."""
+    user_id = callback_query.from_user.id
+    info = pending_traitement.get(user_id)
+
+    if not info:
+        await callback_query.answer("⚠️ Session expirée, renvoie le fichier.", show_alert=True)
+        return
+
+    format_choisi = callback_query.data.split("_", 1)[1]  # "video" ou "document"
+    info["format_choisi"] = format_choisi
+    pending_traitement[user_id] = info
+
+    boutons = InlineKeyboardMarkup([
+        [InlineKeyboardButton("⚡ Faible (480p) — Gratuit", callback_data="qualite_480p")],
+        [InlineKeyboardButton("📺 HD (720p/1080p) — Gratuit", callback_data="qualite_hd")],
+        [InlineKeyboardButton("👑 4K Ultra HD — Premium", callback_data="qualite_4k")],
+        [InlineKeyboardButton("👑 8K Extreme HD — Premium", callback_data="qualite_8k")],
+    ])
+    emoji_format = "🎥 Vidéo (streaming)" if format_choisi == "video" else "📁 Document (brut)"
+
+    await callback_query.answer()
+    await callback_query.message.edit_text(
+        f"✅ Format choisi : {emoji_format}\n\n**Choisis maintenant la qualité :**",
+        reply_markup=boutons,
+    )
+
+
+@app.on_callback_query(filters.regex(r"^qualite_"))
+async def callback_choix_qualite(client: Client, callback_query: CallbackQuery):
+    """Étape 2 : choix de la qualité, avec restriction Premium pour 4K/8K, puis lancement du traitement."""
+    user_id = callback_query.from_user.id
+    info = pending_traitement.get(user_id)
+
+    if not info or not info.get("format_choisi"):
+        await callback_query.answer("⚠️ Session expirée, renvoie le fichier.", show_alert=True)
+        return
+
+    qualite = callback_query.data.split("_", 1)[1]  # "480p", "hd", "4k" ou "8k"
+
+    # --------------------------------------------------------------
+    # RESTRICTION PREMIUM : 4K et 8K sont réservés aux plans payants
+    # --------------------------------------------------------------
+    if qualite in QUALITES_PREMIUM:
+        doc_utilisateur = await obtenir_ou_creer_utilisateur(user_id, callback_query.from_user.username)
+        if doc_utilisateur.get("plan", PLAN_PAR_DEFAUT) == "gratuit":
+            await callback_query.answer(
+                "🔒 Cette qualité est réservée aux abonnés Premium ! Tapez /plans pour passer au niveau supérieur.",
+                show_alert=True,
+            )
+            return  # Le menu reste affiché, l'utilisateur peut choisir une autre qualité
+
+    # Tout est en ordre : on retire l'état en attente et on démarre le traitement
+    info = pending_traitement.pop(user_id)
+    await callback_query.answer()
+
+    message_statut = callback_query.message
+    await message_statut.edit_text("⏳ Traitement en cours...")
+
+    await lancer_traitement_final(
+        client=client, user_id=user_id, message_statut=message_statut,
+        message_original=info["message_original"], nouveau_nom=info["nouveau_nom"],
+        format_envoi=info["format_choisi"], qualite=qualite,
+    )
+
+
+# ==============================================================================
+# 11bis. TRAITEMENT FINAL COMMUN : TÉLÉCHARGEMENT, ENVOI, PUBLICATION, NETTOYAGE
+# ==============================================================================
+
+async def lancer_traitement_final(client: Client, user_id: int, message_statut: Message,
+                                   message_original: Message, nouveau_nom: str,
+                                   format_envoi: str, qualite: str | None):
+    """
+    Fonction centrale réutilisée par tous les chemins de traitement (audio,
+    document classique, ou vidéo/document-vidéo après choix du format et de
+    la qualité). Gère : vérification du quota, téléchargement, extraction des
+    métadonnées, envoi, auto-suppression après 15 minutes, publication sur les
+    canaux, mise à jour des statistiques, et nettoyage disque garanti.
+
+    NOTE IMPORTANTE SUR LA "QUALITÉ" : le fichier source vient déjà encodé
+    depuis Telegram — ce bot n'effectue aucun ré-encodage (cela nécessiterait
+    ffmpeg et un temps de traitement bien plus long). Le choix de qualité sert
+    ici de critère d'accès (gratuit/Premium) et est indiqué dans la légende ;
+    la résolution réelle envoyée reste celle du fichier d'origine.
+    """
     # ------------------------------------------------------------------
     # VÉRIFICATION DU QUOTA QUOTIDIEN AVANT TOUT TÉLÉCHARGEMENT
     # ------------------------------------------------------------------
@@ -1074,7 +1362,7 @@ async def traiter_renommage(client: Client, message: Message):
 
     autorise, restant, quota_total = await verifier_quota(user_id, taille_fichier)
     if not autorise:
-        await message.reply_text(
+        await message_statut.edit_text(
             "❌ **Quota quotidien dépassé !**\n\n"
             f"📦 Ton quota : {formater_taille(quota_total)}\n"
             f"🟢 Il te reste : {formater_taille(restant)}\n"
@@ -1087,13 +1375,10 @@ async def traiter_renommage(client: Client, message: Message):
     # bloc `finally`, qui garantit leur suppression du disque quoi qu'il arrive.
     chemin_telechargement = None
     chemin_final = None
-    message_statut = await message.reply_text("⏳ Initialisation du téléchargement...")
 
     try:
         # ------------------------------------------------------------------
-        # a) TÉLÉCHARGEMENT HAUTE VITESSE AVEC BARRE DE PROGRESSION TEMPS RÉEL
-        #    (TgCrypto + connexions parallèles gèrent le débit ; ce code se
-        #    contente d'afficher la progression sans ralentir le transfert)
+        # TÉLÉCHARGEMENT HAUTE VITESSE AVEC BARRE DE PROGRESSION TEMPS RÉEL
         # ------------------------------------------------------------------
         suivi_dl = SuiviProgression(message_statut, "Téléchargement")
         chemin_temp = os.path.join(DOSSIER_DOWNLOADS, f"{user_id}_{int(time.time())}")
@@ -1103,76 +1388,85 @@ async def traiter_renommage(client: Client, message: Message):
             progress=suivi_dl.callback,
         )
 
-        # ------------------------------------------------------------------
         # RENOMMAGE : on déplace le fichier téléchargé vers son nom final
-        # ------------------------------------------------------------------
         dossier_parent = os.path.dirname(chemin_telechargement)
         chemin_final = os.path.join(dossier_parent, nouveau_nom)
         shutil.move(chemin_telechargement, chemin_final)
         chemin_telechargement = None  # évite une double tentative de suppression
 
-        # ------------------------------------------------------------------
-        # c) APPLICATION DE LA MINIATURE PERSONNALISÉE (si elle existe)
-        # ------------------------------------------------------------------
+        # APPLICATION DE LA MINIATURE PERSONNALISÉE (si elle existe)
         infos_thumb = user_thumbnails.get(user_id)
         chemin_thumb = infos_thumb.get("file_path") if infos_thumb else None
         if chemin_thumb and not os.path.isfile(chemin_thumb):
-            chemin_thumb = None  # sécurité si le fichier a été supprimé manuellement
+            chemin_thumb = None
 
         # ------------------------------------------------------------------
-        # d) ENVOI HAUTE VITESSE DU FICHIER RENOMMÉ À L'UTILISATEUR
-        #    La légende applique automatiquement le style de police choisi
-        #    par l'utilisateur via /police (Bold, Gothic, Bubble, etc.).
-        #    Le nom de fichier réel (file_name) reste toujours en texte normal
-        #    pour rester compatible avec tous les systèmes et lecteurs.
+        # EXTRACTION DES MÉTADONNÉES RÉELLES VIA HACHOIR (uniquement pour le
+        # format Vidéo, comme demandé — le format Document n'a pas besoin de
+        # durée/dimensions puisqu'il n'est pas lu en streaming).
         # ------------------------------------------------------------------
-        doc_utilisateur = await obtenir_ou_creer_utilisateur(user_id, message.from_user.username)
+        duree_media, largeur_media, hauteur_media = 0, 0, 0
+        if format_envoi == "video":
+            await message_statut.edit_text("🔎 Analyse des métadonnées du fichier...")
+            duree_media, largeur_media, hauteur_media = extraire_metadonnees_video(chemin_final)
+        elif format_envoi == "audio":
+            duree_media, _, _ = extraire_metadonnees_video(chemin_final)
+
+        # ------------------------------------------------------------------
+        # CONSTRUCTION DE LA LÉGENDE (police personnalisée + mention qualité)
+        # ------------------------------------------------------------------
+        doc_utilisateur = await obtenir_ou_creer_utilisateur(user_id, None)
         style_police = doc_utilisateur.get("font", "normal")
-        legende = (
-            f"✅ **{nouveau_nom}**" if style_police == "normal"
-            else f"✅ {convertir_police(nouveau_nom, style_police)}"
-        )
+        titre_stylise = nouveau_nom if style_police == "normal" else convertir_police(nouveau_nom, style_police)
+        prefixe_titre = f"✅ **{titre_stylise}**" if style_police == "normal" else f"✅ {titre_stylise}"
 
-        await message_statut.edit_text("📤 Envoi du fichier renommé en cours...")
+        note_qualite = f"\n🎞️ Qualité : {NOMS_QUALITES[qualite]}" if qualite else ""
+
+        legende_utilisateur = f"{prefixe_titre}{note_qualite}\n\n⚠️ Ce message sera supprimé dans 15 minutes."
+        legende_canal = f"{prefixe_titre}{note_qualite}"  # sans mention de suppression : publication permanente
+
+        # ------------------------------------------------------------------
+        # ENVOI HAUTE VITESSE DU FICHIER FINAL À L'UTILISATEUR
+        # ------------------------------------------------------------------
+        await message_statut.edit_text("📤 Envoi du fichier en cours...")
         suivi_envoi = SuiviProgression(message_statut, "Envoi")
 
-        if type_media == "video":
+        if format_envoi == "video":
             message_envoye = await client.send_video(
-                chat_id=user_id,
-                video=chemin_final,
-                thumb=chemin_thumb,
-                file_name=nouveau_nom,
-                caption=legende,
-                progress=suivi_envoi.callback,
+                chat_id=user_id, video=chemin_final, thumb=chemin_thumb, file_name=nouveau_nom,
+                caption=legende_utilisateur, duration=duree_media, width=largeur_media,
+                height=hauteur_media, progress=suivi_envoi.callback,
             )
-        elif type_media == "audio":
+        elif format_envoi == "audio":
             message_envoye = await client.send_audio(
-                chat_id=user_id,
-                audio=chemin_final,
-                thumb=chemin_thumb,
-                file_name=nouveau_nom,
-                caption=legende,
-                progress=suivi_envoi.callback,
+                chat_id=user_id, audio=chemin_final, thumb=chemin_thumb, file_name=nouveau_nom,
+                caption=legende_utilisateur, duration=duree_media, progress=suivi_envoi.callback,
             )
-        else:
+        else:  # "document" (y compris une vidéo envoyée volontairement en document brut)
             message_envoye = await client.send_document(
-                chat_id=user_id,
-                document=chemin_final,
-                thumb=chemin_thumb,
-                file_name=nouveau_nom,
-                caption=legende,
-                progress=suivi_envoi.callback,
+                chat_id=user_id, document=chemin_final, thumb=chemin_thumb, file_name=nouveau_nom,
+                caption=legende_utilisateur, progress=suivi_envoi.callback,
             )
 
-        await message_statut.edit_text("✅ Fichier envoyé avec succès !")
+        # Suppression du message d'attente : on ne laisse plus de message "en cours" affiché
+        try:
+            await message_statut.delete()
+        except Exception:
+            pass
+
+        # ------------------------------------------------------------------
+        # PLANIFICATION DE LA SUPPRESSION AUTOMATIQUE DU MESSAGE (15 minutes)
+        # Tâche indépendante : ne bloque pas la suite du traitement (canaux, etc.)
+        # ------------------------------------------------------------------
+        asyncio.create_task(supprimer_message_apres_delai(client, user_id, message_envoye.id))
 
         # Mise à jour de la consommation quotidienne et des statistiques globales
         await ajouter_usage(user_id, taille_fichier)
 
         # ------------------------------------------------------------------
-        # e) PUBLICATION AUTOMATIQUE SUR TOUS LES CANAUX ENREGISTRÉS
-        #    (réutilise le file_id déjà uploadé : aucun ré-upload, donc quasi
-        #    instantané même pour des fichiers volumineux)
+        # PUBLICATION AUTOMATIQUE SUR TOUS LES CANAUX ENREGISTRÉS
+        # (copie sans la mention de suppression : les posts de canal restent
+        # permanents et ne sont PAS concernés par l'auto-suppression 15 min)
         # ------------------------------------------------------------------
         canaux_actuels = user_channels.get(user_id, [])
 
@@ -1180,64 +1474,135 @@ async def traiter_renommage(client: Client, message: Message):
             rapport = "📡 **Résultat de la publication sur tes canaux :**\n\n"
             for canal in canaux_actuels:
                 try:
-                    await message_envoye.copy(chat_id=canal["id"])
+                    await message_envoye.copy(chat_id=canal["id"], caption=legende_canal)
                     rapport += f"✅ {canal['title']}\n"
                 except ChatAdminRequired:
                     rapport += f"❌ {canal['title']} — je ne suis plus administrateur.\n"
                 except FloodWait as e:
                     await asyncio.sleep(e.value)
                     try:
-                        await message_envoye.copy(chat_id=canal["id"])
+                        await message_envoye.copy(chat_id=canal["id"], caption=legende_canal)
                         rapport += f"✅ {canal['title']} (après attente)\n"
                     except Exception as erreur2:
                         rapport += f"❌ {canal['title']} — erreur : `{erreur2}`\n"
                 except RPCError as erreur:
                     rapport += f"❌ {canal['title']} — erreur : `{erreur}`\n"
 
-            await message.reply_text(rapport)
+            await client.send_message(user_id, rapport)
         else:
-            await message.reply_text(
+            await client.send_message(
+                user_id,
                 "ℹ️ Aucun canal enregistré : le fichier n'a pas été publié automatiquement. "
-                "Utilise /ajouter_canal pour en enregistrer."
+                "Utilise /ajouter_canal pour en enregistrer.",
             )
 
     except FloodWait as e:
-        await message.reply_text(f"⏳ Limite Telegram atteinte, réessaie dans {e.value} secondes.")
+        await client.send_message(user_id, f"⏳ Limite Telegram atteinte, réessaie dans {e.value} secondes.")
 
     except Exception as erreur:
         logger.exception("Erreur pendant le traitement du fichier")
-        # Gestion des cas fréquents : fichier trop lourd, permissions manquantes, etc.
-        await message_statut.edit_text(
-            f"❌ **Une erreur est survenue :**\n`{erreur}`\n\n"
-            "Vérifie que le fichier n'est pas trop volumineux et que mes permissions "
-            "sur les canaux sont correctes."
-        )
+        try:
+            await message_statut.edit_text(
+                f"❌ **Une erreur est survenue :**\n`{erreur}`\n\n"
+                "Vérifie que le fichier n'est pas trop volumineux et que mes permissions "
+                "sur les canaux sont correctes."
+            )
+        except Exception:
+            await client.send_message(user_id, f"❌ **Une erreur est survenue :**\n`{erreur}`")
 
     finally:
         # ------------------------------------------------------------------
-        # 12. NETTOYAGE DISQUE GARANTI (s'exécute même en cas d'erreur ou
-        #     d'exception non gérée) :
-        #     a) fichier source téléchargé (s'il n'a pas déjà été déplacé/renommé)
-        #     b) fichier renommé final, une fois envoyé à l'utilisateur et
-        #        aux canaux — aucune donnée temporaire ne doit subsister
+        # NETTOYAGE DISQUE GARANTI (s'exécute même en cas d'erreur) : le
+        # fichier source téléchargé et/ou le fichier renommé final sont
+        # systématiquement supprimés — aucune donnée temporaire ne subsiste
+        # sur le serveur (Railway ou autre hébergeur).
         # ------------------------------------------------------------------
         nettoyer_fichiers(chemin_telechargement, chemin_final)
 
 
 # ==============================================================================
-# 13. GESTION GLOBALE DES ERREURS NON PRÉVUES
+# 13. ABONNEMENT OBLIGATOIRE : GATE GLOBAL + CALLBACK DE VÉRIFICATION
 # ==============================================================================
 
 @app.on_message(filters.private, group=-1)
-async def intercepteur_erreurs(client: Client, message: Message):
+async def intercepteur_verification_abonnement(client: Client, message: Message):
     """
-    Handler appelé en premier (group=-1) à des fins de journalisation ; il
-    laisse ensuite passer le message aux autres handlers via `continue_propagation`.
+    Gate global exécuté AVANT tout autre handler (group=-1) : vérifie que
+    l'utilisateur est abonné au canal obligatoire pour n'importe quel message
+    ou fichier envoyé au bot. Si non abonné, le message est bloqué ici (aucun
+    autre handler ne s'exécute) et un message avec bouton "Vérifier" est envoyé.
+
+    IMPORTANT : `continue_propagation()` ne doit JAMAIS être englobé dans un
+    `try/except` générique — cette méthode fonctionne en levant une exception
+    interne que le dispatcher de Pyrogram intercepte spécifiquement pour
+    savoir qu'il doit continuer vers les autres groupes de handlers. La
+    capturer par erreur (comme dans une version précédente de ce fichier)
+    bloquerait silencieusement TOUS les autres handlers.
     """
-    try:
+    if not message.from_user:
+        return
+
+    user_id = message.from_user.id
+
+    # L'administrateur n'est jamais soumis à la vérification d'abonnement
+    if user_id == ADMIN_ID:
         message.continue_propagation()
-    except Exception:
-        pass
+        return
+
+    abonne = await verifier_abonnement_canal(client, user_id)
+
+    if abonne:
+        message.continue_propagation()
+    else:
+        await envoyer_message_abonnement_requis(client, user_id)
+        # Pas d'appel à continue_propagation() : le message est bloqué ici.
+
+
+@app.on_callback_query(group=-1)
+async def intercepteur_verification_abonnement_callback(client: Client, callback_query: CallbackQuery):
+    """
+    Équivalent du gate ci-dessus, mais pour les clics sur les boutons inline
+    (choix de format, de qualité, de police, etc.). Le bouton "✅ Vérifier"
+    lui-même est toujours exempté, sinon un utilisateur non abonné ne pourrait
+    jamais débloquer son accès.
+    """
+    user_id = callback_query.from_user.id
+
+    if user_id == ADMIN_ID or callback_query.data == "verifier_abonnement":
+        callback_query.continue_propagation()
+        return
+
+    abonne = await verifier_abonnement_canal(client, user_id)
+
+    if abonne:
+        callback_query.continue_propagation()
+    else:
+        await callback_query.answer(
+            "🔒 Tu dois d'abord rejoindre notre canal pour utiliser cette fonctionnalité. "
+            "Tape /start pour voir le bouton d'inscription.",
+            show_alert=True,
+        )
+
+
+@app.on_callback_query(filters.regex(r"^verifier_abonnement$"))
+async def callback_verifier_abonnement(client: Client, callback_query: CallbackQuery):
+    """Traite le clic sur '✅ Vérifier' : re-teste l'abonnement et débloque l'accès si confirmé."""
+    user_id = callback_query.from_user.id
+    abonne = await verifier_abonnement_canal(client, user_id)
+
+    if abonne:
+        await callback_query.answer("✅ Abonnement vérifié, accès débloqué !", show_alert=True)
+        try:
+            await callback_query.message.edit_text(
+                "✅ **Accès débloqué !**\n\nTu peux maintenant utiliser le bot normalement. Tape /start pour commencer."
+            )
+        except Exception:
+            pass
+    else:
+        await callback_query.answer(
+            "❌ Tu n'es toujours pas abonné au canal. Rejoins-le puis réessaie.",
+            show_alert=True,
+        )
 
 
 # ==============================================================================
