@@ -82,7 +82,7 @@ from hachoir.metadata import extractMetadata
 # ==============================================================================
 # 1. CONFIGURATION - À REMPLIR OBLIGATOIREMENT
 # ==============================================================================
-API_ID =  37198974                    # <-- Remplace par ton API_ID (int)
+API_ID =   37198974                   # <-- Remplace par ton API_ID (int)
 API_HASH = "ee486ee12aa06c1b33e245bfb34dd43b"       # <-- Remplace par ton API_HASH (str)
 BOT_TOKEN = "8620294646:AAEA0amd3jaaNf2Zl5vf6X899YCzG27ScYo"     # <-- Remplace par le token donné par @BotFather
 
@@ -666,6 +666,7 @@ async def commande_start(client: Client, message: Message):
         "🎬 Envoie-moi une vidéo, un document ou un audio pour le **renommer** "
         "et le **publier automatiquement** sur tes canaux enregistrés.\n\n"
         "**Commandes disponibles :**\n"
+        "/channel — Menu interactif pour connecter/déconnecter un canal (optionnel)\n"
         "/ajouter_canal @canal ou id — Ajouter un canal (max 4)\n"
         "/mes_canaux — Voir tes canaux enregistrés\n"
         "/supprimer_canal @canal ou id — Retirer un canal\n"
@@ -799,28 +800,42 @@ async def callback_selection_police(client: Client, callback_query: CallbackQuer
 # 8. GESTION DES CANAUX (jusqu'à 4, persistés dans MongoDB)
 # ==============================================================================
 
-@app.on_message(filters.command("ajouter_canal") & filters.private)
-async def ajouter_canal(client: Client, message: Message):
-    user_id = message.from_user.id
+def canal_est_valide(chat) -> bool:
+    """
+    Valide qu'une cible est bien un CANAL Telegram (et uniquement un canal —
+    ni un groupe, ni un utilisateur, ni un bot). C'est la garantie que l'ID
+    stocké est un véritable ID de destination de diffusion (typiquement au
+    format -100xxxxxxxxxx) et jamais un chat_id de bot ou d'utilisateur privé,
+    qui ferait planter send_video/send_document/send_audio si on tentait d'y
+    publier.
+    """
+    return chat.type == enums.ChatType.CHANNEL
 
-    if len(message.command) < 2:
-        await message.reply_text(
-            "⚠️ Utilisation : `/ajouter_canal @nom_du_canal` ou `/ajouter_canal -100xxxxxxxxxx`"
-        )
-        return
 
-    cible = message.command[1]
+async def tenter_ajout_canal(client: Client, user_id: int, cible: str) -> str:
+    """
+    Logique commune d'ajout d'un canal, utilisée à la fois par la commande
+    /ajouter_canal et par le flux interactif déclenché depuis /channel.
+    Retourne le texte de réponse à afficher à l'utilisateur.
+    """
     canaux_actuels = user_channels.setdefault(user_id, [])
 
     if len(canaux_actuels) >= MAX_CANAUX:
-        await message.reply_text(
+        return (
             f"❌ Tu as déjà atteint la limite de **{MAX_CANAUX} canaux**. "
-            f"Supprime-en un avec /supprimer_canal avant d'en ajouter un nouveau."
+            f"Supprime-en un avant d'en ajouter un nouveau."
         )
-        return
 
     try:
         chat = await client.get_chat(cible)
+
+        # Validation stricte : uniquement un canal, jamais un groupe/bot/utilisateur
+        if not canal_est_valide(chat):
+            return (
+                "❌ Ce n'est pas un **canal** Telegram valide (groupe, bot ou "
+                "utilisateur détecté). Fournis le lien, le @username ou l'ID "
+                "(`-100xxxxxxxxxx`) d'un canal de diffusion."
+            )
 
         # Vérifier que le bot est bien administrateur du canal avec droit de publier
         membre_bot = await client.get_chat_member(chat.id, "me")
@@ -828,35 +843,49 @@ async def ajouter_canal(client: Client, message: Message):
             enums.ChatMemberStatus.ADMINISTRATOR,
             enums.ChatMemberStatus.OWNER,
         ):
-            await message.reply_text(
+            return (
                 "❌ Je ne suis pas administrateur de ce canal. "
                 "Ajoute-moi comme **administrateur** avec le droit de publier des messages, "
                 "puis réessaie."
             )
-            return
 
         if any(c["id"] == chat.id for c in canaux_actuels):
-            await message.reply_text("ℹ️ Ce canal est déjà enregistré.")
-            return
+            return "ℹ️ Ce canal est déjà enregistré."
+
+        # Double vérification du format d'ID avant stockage (défense en profondeur)
+        if not str(chat.id).startswith("-100"):
+            return "❌ Format d'ID de canal invalide (attendu : `-100xxxxxxxxxx`)."
 
         canaux_actuels.append({"id": chat.id, "title": chat.title or str(chat.id)})
         await mongo_sauvegarder_canaux(user_id)  # persistance immédiate dans Atlas
 
-        await message.reply_text(
+        return (
             f"✅ Canal **{chat.title}** ajouté avec succès "
             f"({len(canaux_actuels)}/{MAX_CANAUX}).\n"
             f"💾 Sauvegardé de façon permanente dans MongoDB Atlas."
         )
 
     except (ChannelPrivate, UsernameNotOccupied, PeerIdInvalid):
-        await message.reply_text(
+        return (
             "❌ Canal introuvable. Vérifie le nom d'utilisateur ou l'identifiant, "
             "et assure-toi que je suis bien membre du canal."
         )
     except ChatAdminRequired:
-        await message.reply_text("❌ Je dois être administrateur de ce canal pour l'ajouter.")
+        return "❌ Je dois être administrateur de ce canal pour l'ajouter."
     except RPCError as erreur:
-        await message.reply_text(f"❌ Erreur Telegram : `{erreur}`")
+        return f"❌ Erreur Telegram : `{erreur}`"
+
+
+@app.on_message(filters.command("ajouter_canal") & filters.private)
+async def ajouter_canal(client: Client, message: Message):
+    if len(message.command) < 2:
+        await message.reply_text(
+            "⚠️ Utilisation : `/ajouter_canal @nom_du_canal` ou `/ajouter_canal -100xxxxxxxxxx`"
+        )
+        return
+
+    resultat = await tenter_ajout_canal(client, message.from_user.id, message.command[1])
+    await message.reply_text(resultat)
 
 
 @app.on_message(filters.command("supprimer_canal") & filters.private)
@@ -884,23 +913,130 @@ async def supprimer_canal(client: Client, message: Message):
         await message.reply_text(f"❌ Erreur Telegram : `{erreur}`")
 
 
+def texte_liste_canaux(user_id: int) -> str:
+    """Construit le texte listant les canaux enregistrés d'un utilisateur (canal optionnel : liste vide autorisée)."""
+    canaux_actuels = user_channels.get(user_id, [])
+    if not canaux_actuels:
+        return (
+            "📭 Aucun canal connecté.\n\n"
+            "C'est optionnel : sans canal, tes fichiers renommés sont simplement "
+            "envoyés dans ce tchat privé. Connecte un canal si tu veux qu'ils y "
+            "soient aussi publiés automatiquement."
+        )
+    texte = f"📡 **Canaux connectés ({len(canaux_actuels)}/{MAX_CANAUX}) :**\n\n"
+    for i, canal in enumerate(canaux_actuels, start=1):
+        texte += f"{i}. {canal['title']} (`{canal['id']}`)\n"
+    return texte
+
+
 @app.on_message(filters.command("mes_canaux") & filters.private)
 async def mes_canaux(client: Client, message: Message):
+    await message.reply_text(texte_liste_canaux(message.from_user.id))
+
+
+# --------------------------------------------------------------------------
+# /channel — INTERFACE INTERACTIVE DE CONNEXION DE CANAL (boutons)
+# --------------------------------------------------------------------------
+# Dictionnaire : user_id -> True si le bot attend que l'utilisateur envoie
+# le @username / lien / ID du canal à connecter (déclenché depuis /channel).
+pending_ajout_canal: dict[int, bool] = {}
+
+
+@app.on_message(filters.command("channel") & filters.private)
+async def commande_channel(client: Client, message: Message):
+    """Menu interactif de configuration du canal de publication (connexion optionnelle)."""
     user_id = message.from_user.id
     canaux_actuels = user_channels.get(user_id, [])
 
+    boutons = [[InlineKeyboardButton("➕ Connecter un canal", callback_data="canal_ajouter")]]
+    if canaux_actuels:
+        boutons.append([InlineKeyboardButton("🗑️ Déconnecter un canal", callback_data="canal_retirer_menu")])
+    boutons.append([InlineKeyboardButton("📋 Voir mes canaux", callback_data="canal_liste")])
+
+    await message.reply_text(
+        "⚙️ **Configuration du canal de publication**\n\n"
+        + texte_liste_canaux(user_id)
+        + "\n\nLa connexion d'un canal est **entièrement optionnelle** : "
+        "sans canal connecté, tes fichiers sont simplement envoyés dans ce tchat.",
+        reply_markup=InlineKeyboardMarkup(boutons),
+    )
+
+
+@app.on_callback_query(filters.regex(r"^canal_liste$"))
+async def callback_canal_liste(client: Client, callback_query: CallbackQuery):
+    await callback_query.answer()
+    await callback_query.message.edit_text(texte_liste_canaux(callback_query.from_user.id))
+
+
+@app.on_callback_query(filters.regex(r"^canal_ajouter$"))
+async def callback_canal_ajouter(client: Client, callback_query: CallbackQuery):
+    user_id = callback_query.from_user.id
+    pending_ajout_canal[user_id] = True
+    await callback_query.answer()
+    await callback_query.message.edit_text(
+        "✏️ **Envoie-moi maintenant** le lien, le @username ou l'ID (`-100xxxxxxxxxx`) "
+        "du canal à connecter.\n\n"
+        "⚠️ Assure-toi de m'avoir ajouté comme **administrateur** du canal au préalable.\n\n"
+        "Tape /annuler pour annuler."
+    )
+
+
+@app.on_callback_query(filters.regex(r"^canal_retirer_menu$"))
+async def callback_canal_retirer_menu(client: Client, callback_query: CallbackQuery):
+    user_id = callback_query.from_user.id
+    canaux_actuels = user_channels.get(user_id, [])
+
     if not canaux_actuels:
-        await message.reply_text(
-            "📭 Tu n'as aucun canal enregistré.\n"
-            "Utilise `/ajouter_canal @nom_du_canal` pour en ajouter un."
-        )
+        await callback_query.answer("📭 Aucun canal à déconnecter.", show_alert=True)
         return
 
-    texte = f"📡 **Tes canaux enregistrés ({len(canaux_actuels)}/{MAX_CANAUX}) :**\n\n"
-    for i, canal in enumerate(canaux_actuels, start=1):
-        texte += f"{i}. {canal['title']} (`{canal['id']}`)\n"
+    boutons = [
+        [InlineKeyboardButton(f"🗑️ {canal['title']}", callback_data=f"canal_retirer_{canal['id']}")]
+        for canal in canaux_actuels
+    ]
+    await callback_query.answer()
+    await callback_query.message.edit_text(
+        "Sélectionne le canal à déconnecter :",
+        reply_markup=InlineKeyboardMarkup(boutons),
+    )
 
-    await message.reply_text(texte)
+
+@app.on_callback_query(filters.regex(r"^canal_retirer_-?\d+$"))
+async def callback_canal_retirer_confirmer(client: Client, callback_query: CallbackQuery):
+    user_id = callback_query.from_user.id
+    chat_id_cible = int(callback_query.data.split("_")[-1])
+
+    canaux_actuels = user_channels.get(user_id, [])
+    avant = len(canaux_actuels)
+    canal_supprime = next((c for c in canaux_actuels if c["id"] == chat_id_cible), None)
+    user_channels[user_id] = [c for c in canaux_actuels if c["id"] != chat_id_cible]
+
+    if len(user_channels[user_id]) < avant:
+        await mongo_sauvegarder_canaux(user_id)
+        await callback_query.answer(f"✅ Canal déconnecté : {canal_supprime['title']}", show_alert=True)
+        await callback_query.message.edit_text(texte_liste_canaux(user_id))
+    else:
+        await callback_query.answer("ℹ️ Ce canal n'était pas connecté.", show_alert=True)
+
+
+def filtre_attente_ajout_canal(_, __, message: Message) -> bool:
+    """Filtre : vrai si le bot attend un @username/ID de canal de la part de cet utilisateur."""
+    return bool(message.from_user) and message.from_user.id in pending_ajout_canal
+
+
+filtre_ajout_canal = filters.create(filtre_attente_ajout_canal)
+
+
+@app.on_message(filters.text & filters.private & filtre_ajout_canal & ~filters.command("annuler"))
+async def traiter_ajout_canal_interactif(client: Client, message: Message):
+    """Réceptionne le @username/lien/ID envoyé après un clic sur '➕ Connecter un canal'."""
+    user_id = message.from_user.id
+    pending_ajout_canal.pop(user_id, None)
+
+    cible = message.text.strip()
+    resultat = await tenter_ajout_canal(client, user_id, cible)
+    await message.reply_text(resultat)
+
 
 
 # ==============================================================================
@@ -1191,7 +1327,12 @@ async def reception_fichier(client: Client, message: Message):
 @app.on_message(filters.command("annuler") & filters.private)
 async def annuler_operation(client: Client, message: Message):
     user_id = message.from_user.id
-    if pending_rename.pop(user_id, None):
+    annule = bool(
+        pending_rename.pop(user_id, None)
+        or pending_traitement.pop(user_id, None)
+        or pending_ajout_canal.pop(user_id, None)
+    )
+    if annule:
         await message.reply_text("🚫 Opération annulée.")
     else:
         await message.reply_text("ℹ️ Aucune opération en cours.")
