@@ -1563,7 +1563,7 @@ async def lancer_traitement_final(client: Client, user_id: int, message_statut: 
 
         note_qualite = f"\n🎞️ Qualité : {NOMS_QUALITES[qualite]}" if qualite else ""
 
-        legende_utilisateur = f"{prefixe_titre}{note_qualite}
+        legende_utilisateur = f"{prefixe_titre}{note_qualite}"
         legende_canal = f"{prefixe_titre}{note_qualite}"  # sans mention de suppression : publication permanente
 
         # ------------------------------------------------------------------
